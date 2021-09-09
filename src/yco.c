@@ -118,9 +118,9 @@ static struct YCoAttr default_attr;
  * facility functions
  * */
 
-uint64_t get_next_task_num_id() {
-    static uint64_t id = 1;
-    if (id == 0) { // 0 reserved for main task
+int64_t get_next_task_num_id() {
+    static int64_t id = 1;
+    if (id <= 0) { // 0 reserved for main task
         id = 1;
     }
     return id ++;
@@ -258,7 +258,7 @@ void yco_wrapper(void *(*f)(void *), void *input, void *output) {
         *((uint64_t *)output) = res;
     }
 
-    struct YCoTask *prev_task = cur_task->prev; // nerver could be null
+    struct YCoTask *prev_task = cur_task->prev; // would never be null
     struct YCoTask *next_task = cur_task->next;
     if (next_task == NULL) {
         prev_task->next = NULL;

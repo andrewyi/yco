@@ -5,8 +5,7 @@
 
 typedef void* yco_id_t; // the address of YCoTask
 
-// #define DEFAULT_STACK_SIZE (1024*1024*8)
-#define DEFAULT_STACK_SIZE (1024*512)
+#define DEFAULT_STACK_SIZE (1024*1024*8)
 #define RESERVED_STACK_HEADER_SIZE (1024*128)
 #define RESERVED_STACK_TAIL_SIZE (1024*128)
 
@@ -30,7 +29,7 @@ struct YCoTask {
     struct YCoTask *prev;
     struct YCoTask *next;
 
-    uint64_t num_id; // for debug purpose
+    int64_t num_id; // for debug purpose
 
     int state;
     uint64_t attr;
@@ -54,7 +53,7 @@ struct YCoTask {
     void *output;
 };
 
-uint64_t get_next_task_num_id();
+int64_t get_next_task_num_id();
 int64_t get_task_num_id(yco_id_t);
 
 int yco_init();

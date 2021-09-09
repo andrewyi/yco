@@ -37,8 +37,9 @@ void *func4(void *input) {
 
 void *func5(void *input) {
     uint64_t res = (uint64_t)input;
-    for (int i=0; i!=100; i++) {
+    for (int i=0; i!=10; i++) {
         res ++;
+        yco_schedule();
     }
     return (void *)res;
 }
@@ -52,7 +53,7 @@ int main() {
     yco_schedule();
 
     struct YCoAttr attr;
-    yco_attr_init(&attr, 1, 1024*1024*10);
+    yco_attr_init(&attr, 1, 1024*512);
 
     yco_id_t coid1, coid2, coid3;
     uint64_t res1, res2, res3;
