@@ -1,129 +1,255 @@
 #include "yco.h"
 #include "yco_ctx.h"
 
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
 
-static struct YCoTask tasks[MAX_CO_COUNT];
-static int cur_ind;
-static void *cur_reg_area;
+/*
+ * internal functions
+ * */
 
-void _yco_clear_task_areas(struct YCoTask *task) {
-    // 8 reg area  + 3 func area
-    memset(&(task->r15), sizeof(void *) * (8+3), 0x0);
-    return ;
-}
-
-int yco_init() {
-    memset(tasks, MAX_CO_COUNT*sizeof(struct YCoTask), 0x0);
-
-    // main
-    tasks[0].state = YCO_STATE_RUNNING;
-
-    for (int i=1; i!=MAX_CO_COUNT; i++) {
-        tasks[i].state = YCO_STATE_AVAILABLE;
-    }
-
-    yco_set_cur_task(0);
-    return 0;
-}
-
-int yco_cleanup() {
-    for (int i=0; i!=MAX_CO_COUNT; i++) {
-        if (tasks[i].mem != NULL) {
-            free(tasks[i].mem);
-            tasks[i].mem = NULL;
+static void _yco_clear_tasks(struct YCoTask *header) {
+    struct YCoTask *next = NULL;
+    while (header != NULL) {
+        if (header->mem != NULL) {
+            free(header->mem);
         }
+        next = header->next;
+        free(header);
+        header = next;
+    }
+}
+
+// task must not be NULL
+static void _yco_empty_task_except_mem(struct YCoTask *task) {
+    task->prev = NULL;
+    task->next= NULL;
+    task->num_id = 0;
+    task->state = 0;
+    task->attr = 0;
+    // task->stack_size no touched
+    // task->mem no touched
+    // task->stack_start no touched
+    task->r15 = 0;
+    task->r14 = 0;
+    task->r13 = 0;
+    task->r12 = 0;
+    task->rbx = 0;
+    task->rbp = 0;
+    task->rsp = 0;
+    task->rip = 0;
+    task->f = NULL;
+    task->input = NULL;
+    task->output= NULL;
+}
+
+// task must not be NULL
+// return 0 on sucess, -1 failed
+static int _yco_resize_task_stack(struct YCoTask *task, uint32_t size) {
+    if (task->stack_size == size) {
+        memset(task->mem, size, 0x0);
+        return 0;
     }
 
-    yco_set_cur_task(0);
-    memset(tasks, MAX_CO_COUNT*sizeof(struct YCoTask), 0x0);
+    if (task->mem != NULL) {
+        free(task->mem);
+    }
+
+    task->mem = malloc(size);
+    if (task->mem == NULL) {
+        return -1;
+    }
+    memset(task->mem, size, 0x0);
+    task->stack_size = size;
+    task->stack_start = task->mem + size - RESERVED_STACK_HEADER_SIZE;
 
     return 0;
 }
 
-int yco_get_cur_ind() {
-    return cur_ind;
+// task must not be NULL
+static void _yco_clear_task_areas(struct YCoTask *task) {
+    // 8 reg area  + 3 func area
+    // memset(&(task->r15), sizeof(void *) * (8+3), 0x0);
+    task->r15 = 0;
+    task->r14 = 0;
+    task->r13 = 0;
+    task->r12 = 0;
+    task->rbx = 0;
+    task->rbp = 0;
+    task->rsp = 0;
+    task->rip = 0;
+    task->f = NULL;
+    task->input = NULL;
+    task->output= NULL;
 }
 
-int yco_set_cur_task(int ind) {
-    if (ind < 0 || ind >= MAX_CO_COUNT) {
+// task must not be NULL, will raise SIGSEGV if overflow
+static void _yco_check_stackoverflow(struct YCoTask *task) {
+    // do not check main coroutine, leave it to os
+    if ((task->attr & YCO_ATTR_MAIN) != 0) {
+        return ;
+    }
+
+    uint32_t used_stack_size = (uint32_t)(
+            (uint64_t)task->stack_start - task->rsp);
+    uint32_t max_stack_size = task->stack_size -
+                              RESERVED_STACK_HEADER_SIZE -
+                              RESERVED_STACK_TAIL_SIZE;
+
+    if (used_stack_size > max_stack_size) {
+        // stack overflow
+        // printf("%lu: %u - %u\n", task->num_id, used_stack_size, max_stack_size);
+        raise(SIGSEGV);
+    }
+}
+
+/*
+ * global vars
+ * */
+
+static struct YCoTask *running_tasks; // created/running state
+static struct YCoTask *exited_tasks;
+static struct YCoTask *reclaimed_tasks;
+static struct YCoTask *cur_task;
+static struct YCoAttr default_attr;
+
+/*
+ * facility functions
+ * */
+
+uint64_t get_next_task_num_id() {
+    static uint64_t id = 1;
+    if (id == 0) { // 0 reserved for main task
+        id = 1;
+    }
+    return id ++;
+}
+
+// return -1 when yco_id is NULL
+int64_t get_task_num_id(yco_id_t yco_id) {
+    if (yco_id == NULL) {
         return -1;
     }
 
-    cur_ind = ind;
-    cur_reg_area = &(tasks[ind].r15);
+    struct YCoTask *task = (struct YCoTask *)yco_id;
+    return (int64_t)task->num_id;
+}
+
+// return -1 when failed
+int yco_init() {
+    // set cur_task as main task
+    cur_task = (struct YCoTask *)malloc(sizeof(struct YCoTask));
+    if (cur_task == NULL) {
+        return -1;
+    }
+    cur_task->state = YCO_STATE_RUNNING;
+    cur_task->attr |= YCO_ATTR_MAIN;
+
+    running_tasks = cur_task;
+    exited_tasks = NULL;
+    reclaimed_tasks = NULL;
+
+    default_attr.is_joinable = 0;
+    default_attr.stack_size = DEFAULT_STACK_SIZE;
+
     return 0;
 }
 
-int yco_get_next_available_ind() {
-    for (int i=1; i!=MAX_CO_COUNT; i++) {
-        if (tasks[i].state == YCO_STATE_AVAILABLE) {
-            return i;
-        }
-    }
+// always return 0
+int yco_cleanup() {
+    _yco_clear_tasks(running_tasks);
+    _yco_clear_tasks(exited_tasks);
+    _yco_clear_tasks(reclaimed_tasks);
+    cur_task = NULL;
 
-    return -1;
+    return 0;
 }
 
-int yco_get_next_schedulable_ind() {
-    for (int i=0; i!=MAX_CO_COUNT; i++) {
-        int next_ind = i + cur_ind + 1;
-        if (next_ind >= MAX_CO_COUNT) {
-            next_ind -= MAX_CO_COUNT;
-        }
+// return NULL if failed
+struct YCoTask *yco_make_task_struct() {
+    struct YCoTask *task = NULL;
 
-        if (tasks[next_ind].state == YCO_STATE_CREATED ||
-                tasks[next_ind].state == YCO_STATE_RUNNING ) {
-            return next_ind;
+    if (reclaimed_tasks == NULL) {
+        task = (struct YCoTask *)malloc(sizeof(struct YCoTask));
+
+    } else {
+        task = reclaimed_tasks;
+        reclaimed_tasks = reclaimed_tasks->next;
+        if (reclaimed_tasks != NULL) {
+            reclaimed_tasks->prev = NULL;
         }
     }
+    _yco_empty_task_except_mem(task);
 
-    return -1;
+    return task;
 }
 
-void yco_create(int *yco_id, void *(*f)(void *), void *input, void *output, int join) {
-    yco_push_ctx(cur_reg_area); // !!! always put this at the beginning
+// attr must not be null
+int yco_attr_init(
+        struct YCoAttr *attr,
+        int is_joinable,
+        uint32_t stack_size
+        )
+{
+    if (attr == NULL) {
+        return -1;
+    }
+    attr->is_joinable = is_joinable;
+    attr->stack_size = stack_size;
+    return 0;
+}
 
-    int next_ind = yco_get_next_available_ind();
-    if (next_ind == -1) {
-        fprintf(stderr, "create tasks failed, pool full");
-        exit(-1);
+void yco_create(
+        yco_id_t *yco_id,
+        void *(*f)(void *),
+        void *input,
+        void *output,
+        struct YCoAttr *attr
+        )
+{
+    yco_push_ctx(&(cur_task->r15)); // !!! always put this at the beginning
+
+    if (attr == NULL) {
+        attr = &default_attr;
     }
 
+    struct YCoTask *new_task = yco_make_task_struct();
+    if (new_task == NULL) {
+        if (yco_id != NULL) {
+            *(uint64_t *)yco_id = INVALID_YCO_ID;
+        }
+        return ;
+    }
     if (yco_id != NULL) {
-        *yco_id = next_ind;
+        *yco_id = (yco_id_t)new_task;
+    }
+    _yco_empty_task_except_mem(new_task);
+    _yco_resize_task_stack(new_task, attr->stack_size);
+
+    new_task->num_id = get_next_task_num_id();
+
+    if (attr->is_joinable != 0) {
+        new_task->attr |= YCO_ATTR_JOINABLE;
     }
 
-    struct YCoTask *task = tasks + next_ind;
-    _yco_clear_task_areas(task);
+    new_task->rsp = (uint64_t)(new_task->stack_start - sizeof(void *));
+    new_task->rip = (uint64_t)&yco_wrapper;
+    new_task->f = f;
+    new_task->input = input;
+    new_task->output = output;
 
-    if (task->mem == NULL) {
-        task->mem = malloc(DEFAULT_STACK_SIZE);
-        if (task->mem == NULL) {
-            fprintf(stderr, "malloc task stack failed");
-            exit(-1);
-        }
-    }
-    memset(task->mem, DEFAULT_STACK_SIZE, 0x0);
-    task->stack_start = task->mem + DEFAULT_STACK_SIZE - RESERVED_STACK_SIZE;
-
-    if (join != 0) {
-        task->attr |= YCO_ATTR_JOINABLE;
+    struct YCoTask *tmp = cur_task->next;
+    cur_task->next = new_task;
+    new_task->prev = cur_task;
+    if (tmp != NULL) {
+        new_task->next = tmp;
+        tmp->prev = new_task;
     }
 
-    task->rsp = (uint64_t)(task->stack_start - sizeof(void *));
-    task->rip = (uint64_t)&yco_wrapper;
-
-    task->f = f;
-    task->input = input;
-    task->output = output;
-
-    // go run
-    yco_set_cur_task(next_ind);
-    task->state = YCO_STATE_RUNNING;
-    yco_use_ctx_run(&(task->r15), &(task->f));
+    cur_task = new_task;
+    cur_task->state = YCO_STATE_RUNNING;
+    yco_use_ctx_run(&(cur_task->r15), &(cur_task->f));
 }
 
 void yco_wrapper(void *(*f)(void *), void *input, void *output) {
@@ -132,73 +258,72 @@ void yco_wrapper(void *(*f)(void *), void *input, void *output) {
         *((uint64_t *)output) = res;
     }
 
-    struct YCoTask *task = tasks + cur_ind;
-    if ((task->attr & YCO_ATTR_JOINABLE) == 0) {
-        task->state = YCO_STATE_AVAILABLE;
-        task->attr = 0;
-        _yco_clear_task_areas(task);
+    struct YCoTask *prev_task = cur_task->prev; // nerver could be null
+    struct YCoTask *next_task = cur_task->next;
+    if (next_task == NULL) {
+        prev_task->next = NULL;
+
     } else {
-        task->state = YCO_STATE_EXITED;
+        prev_task->next = next_task;
+        next_task->prev = prev_task;
     }
 
-    int next_ind = yco_get_next_schedulable_ind();
-    if (next_ind == -1) {
-        fprintf(stderr, "one task return but no more to schedule");
-        exit(-1);
+    cur_task->prev = NULL;
+    cur_task->next = NULL;
+
+    if ( (cur_task->attr & YCO_ATTR_JOINABLE) != 0 ) {
+        cur_task->state = YCO_STATE_EXITED;
+
+        cur_task->next = exited_tasks;
+        if (exited_tasks != NULL) {
+            exited_tasks->prev = cur_task;
+        }
+        exited_tasks = cur_task;
+
+    } else {
+        cur_task->state = YCO_STATE_UNDEFINED;
+
+        cur_task->next = reclaimed_tasks;
+        if (reclaimed_tasks != NULL) {
+            reclaimed_tasks->prev = cur_task;
+        }
+        reclaimed_tasks = cur_task;
     }
 
-    yco_set_cur_task(next_ind);
-    struct YCoTask *next_task = tasks + next_ind;
-    if (next_task->state != YCO_STATE_RUNNING) {
-        next_task->state = YCO_STATE_RUNNING;
+    if (next_task == NULL) {
+        next_task = running_tasks;
     }
-    yco_use_ctx(&(next_task->r15));
+    cur_task = next_task;
+    yco_use_ctx(&(cur_task->r15));
 }
 
 void yco_schedule() {
-    yco_push_ctx(cur_reg_area); // !!! always put this at the beginning
+    yco_push_ctx(&(cur_task->r15)); // !!! always put this at the beginning
 
-    int next_ind = yco_get_next_schedulable_ind();
-    if (next_ind == -1) {
-        return;
-    }
-    // printf("cur ind: %d, next ind: %d\n", cur_ind, next_ind);
+    _yco_check_stackoverflow(cur_task);
 
-    yco_set_cur_task(next_ind);
-    struct YCoTask *next_task = tasks + next_ind;
-    if (next_task->state != YCO_STATE_RUNNING) {
-        next_task->state = YCO_STATE_RUNNING;
+    struct YCoTask *next_task = cur_task->next;
+    if (next_task == NULL) {
+        if ((cur_task->attr & YCO_ATTR_MAIN) != 0) {
+            // only main coroutine exists
+            return ; 
+        }
+
+        // wrap to header
+        next_task = running_tasks;
     }
-    yco_use_ctx(&(next_task->r15));
+
+    cur_task = next_task;
+    yco_use_ctx(&(cur_task->r15));
 }
 
-void yco_try_schedule_to(int next_ind) {
-    yco_push_ctx(cur_reg_area); // !!! always put this at the beginning
-
-    if (next_ind < 0 || next_ind > MAX_CO_COUNT) {
-        return ;
-    }
-
-    struct YCoTask *next_task = tasks + next_ind;
-    if (next_task->state != YCO_STATE_RUNNING &&
-            next_task->state != YCO_STATE_RUNNING) {
-        return ;
-    }
-
-    yco_set_cur_task(next_ind);
-    if (next_task->state != YCO_STATE_RUNNING) {
-        next_task->state = YCO_STATE_RUNNING;
-    }
-    yco_use_ctx(&(next_task->r15));
-}
-
-int yco_join(int ind) {
-    struct YCoTask *task = tasks + ind;
+int yco_join(yco_id_t yco_id) {
+    struct YCoTask *task = (struct YCoTask *)yco_id;
     if ((task->attr & YCO_ATTR_JOINABLE) == 0) {
         return -1;
     }
 
-    if (task->state != YCO_STATE_RUNNING &&
+    if (task->state != YCO_STATE_CREATED &&
             task->state != YCO_STATE_RUNNING &&
             task->state != YCO_STATE_EXITED) {
         return -1;
@@ -208,8 +333,44 @@ int yco_join(int ind) {
         yco_schedule();
     }
 
-    task->state = YCO_STATE_AVAILABLE;
-    task->attr = 0;
-    _yco_clear_task_areas(task);
+    struct YCoTask *prev_task = task->prev;
+    struct YCoTask *next_task = task->next;
+    if (task == exited_tasks) { // head
+        exited_tasks = exited_tasks->next;
+        if (exited_tasks != NULL) {
+            exited_tasks->prev = NULL;
+        }
+
+    } else {
+        if (next_task == NULL) {
+            prev_task->next = NULL;
+
+        } else {
+            prev_task->next = next_task;
+            next_task->prev = prev_task;
+        }
+    }
+
+    task->prev = NULL;
+    task->next = NULL;
+
+    task->state = YCO_STATE_UNDEFINED;
+
+    task->next = reclaimed_tasks;
+    if (reclaimed_tasks != NULL) {
+        reclaimed_tasks->prev = task;
+    }
+    reclaimed_tasks = task;
+
     return 0;
+}
+
+void yco_wait_all() {
+    while (running_tasks->next != NULL) {
+        yco_schedule();
+    }
+
+    while (exited_tasks != NULL) {
+        yco_join((yco_id_t)exited_tasks);
+    }
 }
