@@ -3,6 +3,10 @@
 
 #include <stdint.h>
 
+#define __USE_GNU // to use register index
+#include <ucontext.h>
+#include <signal.h>
+
 typedef void* yco_id_t; // the address of YCoTask
 
 #define DEFAULT_STACK_SIZE (1024*1024*8)
@@ -19,6 +23,8 @@ typedef void* yco_id_t; // the address of YCoTask
 
 #define YCO_ATTR_MAIN (0x1<<0)
 #define YCO_ATTR_JOINABLE (0x1<<1) // default detach
+
+#define PREEMPT_SIGNAL SIGUSR2
 
 struct YCoAttr {
     int is_joinable;
@@ -77,5 +83,8 @@ void yco_wrapper(void *(*)(void *), void *, void *);
 void yco_schedule();
 int yco_join(yco_id_t);
 void yco_wait_all();
+
+void preempt_stub();
+void preempt_sig_handler(int , siginfo_t *, void *);
 
 #endif //_YCO_H_
