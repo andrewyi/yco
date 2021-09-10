@@ -217,6 +217,13 @@ void yco_create(
         struct YCoAttr *attr
         )
 {
+    if (f == NULL) {
+        if (yco_id != NULL) {
+            *(uint64_t *)yco_id = INVALID_YCO_ID;
+        }
+        return ;
+    }
+
     yco_push_ctx(&(cur_task->r15)); // !!! always put this at the beginning
 
     if (attr == NULL) {
@@ -433,7 +440,7 @@ void preempt_sig_handler(int sig_num, siginfo_t *info, void *u) {
     uint64_t rip = (uint64_t)ctx->uc_mcontext.gregs[REG_RIP];
     uint64_t rsp = (uint64_t)ctx->uc_mcontext.gregs[REG_RSP];
 
-    uint64_t new_rsp = rsp -0x8; // move rsp forward to hold return addr
+    uint64_t new_rsp = rsp - 0x8; // move rsp forward to hold return addr
     *(uint64_t *)new_rsp  = rip; // prepare return addr
     ctx->uc_mcontext.gregs[REG_RSP] = (long long int)(new_rsp);
     ctx->uc_mcontext.gregs[REG_RIP] = (long long int)&preempt_stub; // call
